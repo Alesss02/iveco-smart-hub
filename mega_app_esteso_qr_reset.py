@@ -50,6 +50,8 @@ PROB_REWORK = 0.05
 COEFF_REWORK_TIME = 1.4
 MOLTIPLICATORE_REWORK_ECO = 1.5
 SLA_DELAY_TOLERANCE_H = 2.0
+PENALTY_TECNICO_IMPEGNATO = 35.0
+COEFF_TEMPO_TECNICO_IMPEGNATO = 1.20
 
 IMPATTO_BASE = {
     "Motore": {"Olio_L": 5.0, "Scarti_Kg": 2.0, "Energia_kWh": 5.0},
@@ -222,7 +224,7 @@ def make_row(entity_type: str, entity_id: str, data: dict, created_at: Optional[
 
 def bootstrap_store() -> None:
     rows = [make_row("technician", tech, payload) for tech, payload in initial_skill_profiles().items()]
-    rows.append(make_row("meta", "system", {"version": "Integrated 2.0", "description": "Store unificato CSV per officina + DSS + planning + audit"}))
+    rows.append(make_row("meta", "system", {"version": "mega_app_esteso_qr_reset_v3", "description": "Store unificato CSV per officina + DSS + planning + audit"}))
     rows.append(make_row("audit", f"AUD-{int(time.time())}", {"event": "bootstrap", "details": "Inizializzazione database unificato", "ts": utc_now_iso()}))
     pd.DataFrame(rows).to_csv(STORE_FILE, index=False)
 
@@ -431,6 +433,52 @@ def apply_decay_to_inactive_skills(tech_profiles: Dict[str, dict], work_df: pd.D
     return tech_profiles
 
 
+def get_active_work_map(work_df: pd.DataFrame) -> Dict[str, dict]:
+    """Mappa i tecnici che hanno almeno una bolla in stato In Corso.
+
+    Serve al DSS per non assegnare automaticamente un nuovo intervento a un
+    operatore già impegnato su un'attività avviata, salvo override manuale.
+    """
+    active = {t: {"busy": False, "jobs": [], "vehicles": []} for t in TECNICI}
+    if work_df.empty or "stato_lavoro" not in work_df.columns or "tecnico" not in work_df.columns:
+        return active
+    running = work_df[work_df["stato_lavoro"].astype(str) == "In Corso"].copy()
+    for _, row in running.iterrows():
+        tech = row.get("tecnico")
+        if tech in active:
+            active[tech]["busy"] = True
+            active[tech]["jobs"].append(str(row.get("id", "")))
+            active[tech]["vehicles"].append(str(row.get("veicolo", "")))
+    return active
+
+
+def technician_availability_df(work_df: pd.DataFrame) -> pd.DataFrame:
+    active_map = get_active_work_map(work_df)
+    weekly_map = get_weekly_hours_map(work_df, iso_week_str(utc_now_iso()))
+    rows = []
+    for tech in TECNICI:
+        active = active_map.get(tech, {"busy": False, "jobs": [], "vehicles": []})
+        weekly_h = float(weekly_map.get(tech, 0.0))
+        overload = assess_overload(weekly_h, get_days_elapsed_in_week())
+        if active["busy"]:
+            stato = "In corso"
+        elif overload["status"] == "CRITICO":
+            stato = "Critico"
+        elif overload["status"] == "ATTENZIONE":
+            stato = "Sovraccarico"
+        else:
+            stato = "Disponibile"
+        rows.append({
+            "Tecnico": tech,
+            "Stato disponibilità": stato,
+            "Bolla in corso": ", ".join(active["jobs"]) if active["jobs"] else "-",
+            "Veicolo in corso": ", ".join([v for v in active["vehicles"] if v]) if active["vehicles"] else "-",
+            "Ore settimana": round(weekly_h, 2),
+            "Stato carico": overload["status"],
+        })
+    return pd.DataFrame(rows)
+
+
 def compute_priority_score(urgenza: str, fermo_veicolo: bool, safety_risk: bool, ricambi_disponibili: bool, sla_hours: float, ore_std: float) -> Tuple[float, str]:
     score = 0.0
     score += {"ALTA": 45, "MEDIA": 28, "BASSA": 15}.get(urgenza, 15)
@@ -454,6 +502,7 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
     current_week = iso_week_str(utc_now_iso())
     week_hours_map = get_weekly_hours_map(work_df, current_week)
     day_load_map = get_daily_load_map(work_df, planned_date)
+    active_work_map = get_active_work_map(work_df)
     rows = []
     days_elapsed = get_days_elapsed_in_week()
     urgency_bonus_map = {"ALTA": 1.25, "MEDIA": 1.0, "BASSA": 0.85}
@@ -464,11 +513,16 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
         weekly_hours = float(week_hours_map.get(tech, 0.0))
         daily_load = float(day_load_map.get(tech, 0.0))
         current_daily_avg = weekly_hours / days_elapsed if days_elapsed else weekly_hours
+        active_info = active_work_map.get(tech, {"busy": False, "jobs": [], "vehicles": []})
+        is_busy = bool(active_info.get("busy", False))
+        busy_jobs = active_info.get("jobs", [])
+        busy_job_label = ", ".join(busy_jobs) if busy_jobs else "-"
 
         coeff_app_time = 1.5 - (skill / 5 * 0.7)
+        coeff_busy = COEFF_TEMPO_TECNICO_IMPEGNATO if is_busy else 1.0
         base_fatigued = current_daily_avg > LIMITE_ORE_GIORNO or daily_load > LIMITE_ORE_GIORNO * 0.85
         base_coeff_fat = 1.25 if base_fatigued else 1.0
-        ore_eff_previste = round(ore_std * coeff_app_time * base_coeff_fat * (1 + PROB_REWORK * (COEFF_REWORK_TIME - 1)), 2)
+        ore_eff_previste = round(ore_std * coeff_app_time * base_coeff_fat * coeff_busy * (1 + PROB_REWORK * (COEFF_REWORK_TIME - 1)), 2)
 
         projected_week_hours = weekly_hours + ore_eff_previste
         projected_daily_load = daily_load + ore_eff_previste
@@ -476,7 +530,7 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
         projected_fatigued = projected_daily_avg > LIMITE_ORE_GIORNO or projected_daily_load > LIMITE_ORE_GIORNO
         final_coeff_fat = 1.25 if projected_fatigued else 1.0
         if final_coeff_fat != base_coeff_fat:
-            ore_eff_previste = round(ore_std * coeff_app_time * final_coeff_fat * (1 + PROB_REWORK * (COEFF_REWORK_TIME - 1)), 2)
+            ore_eff_previste = round(ore_std * coeff_app_time * final_coeff_fat * coeff_busy * (1 + PROB_REWORK * (COEFF_REWORK_TIME - 1)), 2)
             projected_week_hours = weekly_hours + ore_eff_previste
             projected_daily_load = daily_load + ore_eff_previste
             projected_daily_avg = projected_week_hours / days_elapsed if days_elapsed else projected_week_hours
@@ -485,6 +539,7 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
         load_penalty = weekly_hours * 0.22 + daily_load * 0.20
         urgency_bonus = skill * urgency_bonus_map[urgency]
         overload_penalty = 0.0 if overload["status"] == "OK" else (1.5 if overload["status"] == "ATTENZIONE" else 4.0)
+        busy_penalty = PENALTY_TECNICO_IMPEGNATO if is_busy else 0.0
 
         explain_skill = round(skill * 2.5, 2)
         explain_urgency = round(urgency_bonus, 2)
@@ -492,8 +547,10 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
         explain_load = round(-load_penalty, 2)
         explain_fatigue = -2.0 if projected_fatigued else 0.0
         explain_overload = round(-overload_penalty, 2)
+        explain_busy = round(-busy_penalty, 2)
 
-        suitability = round(explain_skill + explain_urgency + explain_priority + explain_load + explain_fatigue + explain_overload, 3)
+        technical_suitability = round(explain_skill + explain_urgency + explain_priority + explain_load + explain_fatigue + explain_overload, 3)
+        suitability = round(technical_suitability + explain_busy, 3)
 
         mentor = "Nessuno"
         affiancamento = False
@@ -505,16 +562,20 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
                 other_prof = tech_profiles.get(other, initial_skill_profiles()[other])
                 other_skill = float(other_prof.get(category, 1.0))
                 other_load = float(week_hours_map.get(other, 0.0))
-                if other_skill >= MIN_SKILL_MENTOR and (other_load / days_elapsed) <= LIMITE_ORE_GIORNO:
+                other_active = active_work_map.get(other, {"busy": False}).get("busy", False)
+                if other_skill >= MIN_SKILL_MENTOR and (other_load / days_elapsed) <= LIMITE_ORE_GIORNO and not other_active:
                     mentors.append((other, other_skill, other_load))
             if mentors:
                 mentors.sort(key=lambda x: (-x[1], x[2]))
                 mentor = mentors[0][0]
                 affiancamento = True
                 suitability += 0.6
+                technical_suitability += 0.6
 
         rows.append({
             "Tecnico": tech,
+            "Disponibilita": "Impegnato" if is_busy else "Disponibile",
+            "Bolla_In_Corso": busy_job_label,
             "Skill": round(skill, 2),
             "Carico_Attuale_h": round(weekly_hours, 2),
             "Carico_Giorno_h": round(daily_load, 2),
@@ -533,13 +594,19 @@ def get_assignment_candidates(category: str, urgency: str, work_df: pd.DataFrame
             "Penalty_Carico": explain_load,
             "Penalty_Fatica": explain_fatigue,
             "Penalty_Overload": explain_overload,
+            "Penalty_Impegno": explain_busy,
+            "Suitability_Tecnica": round(technical_suitability, 3),
             "Suitability_Score": round(suitability, 3),
         })
-    cand = pd.DataFrame(rows).sort_values(
-        by=["Overload_Status", "Suitability_Score", "Skill"],
-        ascending=[True, False, False],
-        key=lambda s: s.map({"OK": 0, "ATTENZIONE": 1, "CRITICO": 2}) if s.name == "Overload_Status" else s,
-    ).reset_index(drop=True)
+    cand = pd.DataFrame(rows)
+    if cand.empty:
+        return cand
+    cand["_Ord_Disponibilita"] = cand["Disponibilita"].map({"Disponibile": 0, "Impegnato": 1}).fillna(2)
+    cand["_Ord_Overload"] = cand["Overload_Status"].map({"OK": 0, "ATTENZIONE": 1, "CRITICO": 2}).fillna(3)
+    cand = cand.sort_values(
+        by=["_Ord_Disponibilita", "_Ord_Overload", "Suitability_Score", "Skill"],
+        ascending=[True, True, False, False],
+    ).drop(columns=["_Ord_Disponibilita", "_Ord_Overload"]).reset_index(drop=True)
     return cand
 
 
@@ -549,6 +616,16 @@ def find_best_alternative(cand_df: pd.DataFrame, selected_tech: str) -> Optional
     alternatives = cand_df[cand_df["Tecnico"] != selected_tech].copy()
     if alternatives.empty:
         return None
+    if "Disponibilita" in alternatives.columns:
+        available = alternatives[alternatives["Disponibilita"] == "Disponibile"]
+        if not available.empty:
+            ok_available = available[available["Overload_Status"] == "OK"]
+            if not ok_available.empty:
+                return ok_available.sort_values(by=["Suitability_Score", "Skill"], ascending=[False, False]).iloc[0]
+            warn_available = available[available["Overload_Status"] == "ATTENZIONE"]
+            if not warn_available.empty:
+                return warn_available.sort_values(by=["Suitability_Score", "Skill"], ascending=[False, False]).iloc[0]
+            return available.sort_values(by=["Suitability_Score", "Skill"], ascending=[False, False]).iloc[0]
     ok_alt = alternatives[alternatives["Overload_Status"] == "OK"]
     if not ok_alt.empty:
         return ok_alt.sort_values(by=["Suitability_Score", "Skill"], ascending=[False, False]).iloc[0]
@@ -1172,21 +1249,28 @@ with manager_tabs[0]:
             cand_df = pd.DataFrame(st.session_state["candidate_table"])
             ctx = st.session_state.get("candidate_context", {})
             top = cand_df.iloc[0]
+            best_absolute = cand_df.sort_values(by=["Suitability_Tecnica", "Skill"], ascending=[False, False]).iloc[0]
             p1, p2, p3 = st.columns(3)
             p1.metric("Priority score", ctx.get("priority_score", 0.0))
             p2.metric("Classe priorità", ctx.get("priority_band", "-"))
             p3.metric("Data pianificata", ctx.get("planned_date", "-"))
-            st.success(f"Suggerimento DSS: **{top['Tecnico']}** | Skill {top['Skill']} | Carico proiettato {top['Carico_Proiettato_h']} h | Stato carico: {top['Overload_Status']} | Mentor: {top['Mentor']}")
+            if str(best_absolute["Tecnico"]) != str(top["Tecnico"]) and str(best_absolute.get("Disponibilita", "")) == "Impegnato":
+                st.warning(
+                    f"⚠️ Il miglior tecnico in termini puramente tecnici sarebbe **{best_absolute['Tecnico']}**, "
+                    f"ma risulta già impegnato sulla bolla **{best_absolute.get('Bolla_In_Corso', '-')}**. "
+                    f"Il DSS propone quindi **{top['Tecnico']}** come migliore alternativa operativamente disponibile."
+                )
+            st.success(f"Suggerimento DSS operativo: **{top['Tecnico']}** | Disponibilità: {top.get('Disponibilita', 'Disponibile')} | Skill {top['Skill']} | Carico proiettato {top['Carico_Proiettato_h']} h | Stato carico: {top['Overload_Status']} | Mentor: {top['Mentor']}")
             display_cols = [
-                "Tecnico", "Skill", "Carico_Attuale_h", "Carico_Giorno_h", "Ore_Eff_Previste", "Carico_Proiettato_h",
+                "Tecnico", "Disponibilita", "Bolla_In_Corso", "Skill", "Carico_Attuale_h", "Carico_Giorno_h", "Ore_Eff_Previste", "Carico_Proiettato_h",
                 "Carico_Giorno_Proiettato_h", "Media_Giornaliera_h", "Capacita_Sett_h", "Affaticato", "Overload_Status",
                 "Mentor", "Affiancamento", "Suitability_Score"
             ]
             st.dataframe(cand_df[display_cols], use_container_width=True, hide_index=True, height=320)
             with st.expander("🔎 Spiegazione del suggerimento DSS"):
-                explain_cols = ["Tecnico", "Score_Skill", "Score_Urgenza", "Score_Priorita", "Penalty_Carico", "Penalty_Fatica", "Penalty_Overload", "Suitability_Score"]
+                explain_cols = ["Tecnico", "Disponibilita", "Score_Skill", "Score_Urgenza", "Score_Priorita", "Penalty_Carico", "Penalty_Fatica", "Penalty_Overload", "Penalty_Impegno", "Suitability_Tecnica", "Suitability_Score"]
                 st.dataframe(cand_df[explain_cols], use_container_width=True, hide_index=True)
-                st.caption("Il punteggio finale combina skill, urgenza, priorità composita, carico operativo e penalità di fatica/overload.")
+                st.caption("Il punteggio finale combina skill, urgenza, priorità composita, carico operativo, penalità di fatica/overload e penalità se il tecnico ha già una bolla in corso.")
             selected = st.selectbox("Tecnico definitivo", cand_df["Tecnico"].tolist(), index=0)
             sel_row = cand_df[cand_df["Tecnico"] == selected].iloc[0]
             alternative = find_best_alternative(cand_df, selected)
@@ -1194,6 +1278,15 @@ with manager_tabs[0]:
             mentor_options = ["Nessuno"] + [t for t in TECNICI if t != selected]
             manual_mentor = st.selectbox("Mentor / supporto", mentor_options, index=0 if sel_row["Mentor"] == "Nessuno" else mentor_options.index(sel_row["Mentor"]))
             overload_status = sel_row["Overload_Status"]
+            selected_busy = str(sel_row.get("Disponibilita", "Disponibile")) == "Impegnato"
+            override_busy = False
+            if selected_busy:
+                alt_busy = find_best_alternative(cand_df, selected)
+                msg_busy = f"⚠️ **{selected}** ha già una bolla in corso: **{sel_row.get('Bolla_In_Corso', '-')}**. Il tempo previsto include una penalità di frammentazione del +{int((COEFF_TEMPO_TECNICO_IMPEGNATO-1)*100)}%."
+                if alt_busy is not None:
+                    msg_busy += f" Alternativa consigliata: **{alt_busy['Tecnico']}**."
+                st.warning(msg_busy)
+                override_busy = st.checkbox("Confermo comunque l'assegnazione a tecnico già impegnato", value=False)
             override_critical = False
             if overload_status == "ATTENZIONE":
                 txt = f"Il tecnico **{selected}** supererà la capacità consigliata ({sel_row['Carico_Proiettato_h']} h su {sel_row['Capacita_Sett_h']} h)."
@@ -1209,7 +1302,7 @@ with manager_tabs[0]:
             else:
                 st.info(f"Carico sotto controllo: {sel_row['Carico_Proiettato_h']} h su capacità teorica {sel_row['Capacita_Sett_h']} h.")
 
-            create_disabled = overload_status == "CRITICO" and not override_critical
+            create_disabled = (overload_status == "CRITICO" and not override_critical) or (selected_busy and not override_busy)
             if st.button("✅ Crea bolla e genera QR", type="primary", use_container_width=True, disabled=create_disabled):
                 ctx = st.session_state.get("candidate_context") or {}
                 mentor_value = manual_mentor if override_aff else (sel_row["Mentor"] if sel_row["Mentor"] != "Nessuno" else "Nessuno")
@@ -1225,9 +1318,14 @@ with manager_tabs[0]:
                     "skill_corrente": pred["skill_corrente"], "is_fatigued": pred["is_fatigued"], "ore_eff_previste": pred["ore_eff"],
                     "carico_attuale_h": float(sel_row["Carico_Attuale_h"]), "carico_proiettato_h": float(sel_row["Carico_Proiettato_h"]),
                     "overload_status": overload_status, "capacity_reference_h": float(sel_row["Capacita_Sett_h"]),
+                    "availability_status_at_assignment": str(sel_row.get("Disponibilita", "Disponibile")),
+                    "busy_source_job": str(sel_row.get("Bolla_In_Corso", "-")),
+                    "best_absolute_tecnico": str(best_absolute["Tecnico"]),
+                    "best_operational_tecnico": str(top["Tecnico"]),
+                    "busy_override": bool(override_busy),
                 })
                 upsert_entity("work_order", job["id"], job)
-                add_audit("create_job", f"Creata bolla {job['id']}", {"job_id": job["id"], "tecnico": selected, "categoria": ctx["categoria"], "overload_status": overload_status})
+                add_audit("create_job", f"Creata bolla {job['id']}", {"job_id": job["id"], "tecnico": selected, "categoria": ctx["categoria"], "overload_status": overload_status, "availability_status": str(sel_row.get("Disponibilita", "Disponibile")), "busy_override": bool(override_busy)})
                 st.session_state["last_created_job_id"] = job["id"]
                 st.session_state["candidate_table"] = None
                 st.session_state["candidate_context"] = None
@@ -1280,6 +1378,8 @@ with manager_tabs[1]:
             day_load_map = get_daily_load_map(work_df, plan_day.isoformat())
             load_view = pd.DataFrame({"Tecnico": list(day_load_map.keys()), "Ore previste": list(day_load_map.values())}).sort_values(by="Ore previste", ascending=False)
             st.dataframe(load_view, use_container_width=True, hide_index=True)
+            st.markdown("#### Disponibilità tecnica live")
+            st.dataframe(technician_availability_df(work_df), use_container_width=True, hide_index=True, height=250)
         with c2:
             st.markdown("#### Bolle pianificate del giorno")
             if not day_df.empty:
@@ -1312,11 +1412,19 @@ with manager_tabs[1]:
         new_day = m4.date_input("Nuova data pianificata", value=dt.date.fromisoformat(str(managed.get("planned_date", local_now().date()))[:10]), key="new_day")
         projected = get_assignment_candidates(managed["categoria"], managed.get("urgenza", "MEDIA"), work_df[work_df["id"] != managed["id"]] if "id" in work_df.columns else work_df, tech_profiles, float(managed.get("ore_std", 0.0)), new_day.isoformat(), float(managed.get("priority_score", 30.0)))
         row = projected[projected["Tecnico"] == new_tech].iloc[0]
+        reassign_busy = str(row.get("Disponibilita", "Disponibile")) == "Impegnato"
+        override_busy_reassign = False
+        override_critical_reassign = False
+        if reassign_busy:
+            st.warning(f"**{new_tech}** risulta già impegnato sulla bolla **{row.get('Bolla_In_Corso', '-')}**. Riassegnazione consigliata solo se operativamente necessaria.")
+            override_busy_reassign = st.checkbox("Confermo riassegnazione a tecnico già impegnato", value=False, key="override_busy_reassign")
         if row["Overload_Status"] == "ATTENZIONE":
             st.warning(f"Riassegnando a **{new_tech}** il carico proiettato salirà a {row['Carico_Proiettato_h']} h su {row['Capacita_Sett_h']} h.")
         elif row["Overload_Status"] == "CRITICO":
             st.error(f"Riassegnazione critica: **{new_tech}** arriverebbe a {row['Carico_Proiettato_h']} h su {row['Capacita_Sett_h']} h.")
-        if st.button("💾 Applica modifica", use_container_width=True):
+            override_critical_reassign = st.checkbox("Confermo riassegnazione in overload critico", value=False, key="override_critical_reassign")
+        reassign_disabled = (reassign_busy and not override_busy_reassign) or (row["Overload_Status"] == "CRITICO" and not override_critical_reassign)
+        if st.button("💾 Applica modifica", use_container_width=True, disabled=reassign_disabled):
             managed["stato_lavoro"] = new_state
             managed["tecnico"] = new_tech
             managed["mentor"] = new_mentor
@@ -1329,6 +1437,9 @@ with manager_tabs[1]:
             managed["carico_proiettato_h"] = float(row["Carico_Proiettato_h"])
             managed["overload_status"] = row["Overload_Status"]
             managed["capacity_reference_h"] = float(row["Capacita_Sett_h"])
+            managed["availability_status_at_assignment"] = str(row.get("Disponibilita", "Disponibile"))
+            managed["busy_source_job"] = str(row.get("Bolla_In_Corso", "-"))
+            managed["busy_override"] = bool(override_busy_reassign)
             upsert_entity("work_order", managed["id"], managed)
             add_audit("edit_job", f"Modificata bolla {managed['id']}", {"job_id": managed["id"], "overload_status": row["Overload_Status"]})
             st.success("Bolla aggiornata correttamente")
