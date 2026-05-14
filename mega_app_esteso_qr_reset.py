@@ -120,6 +120,7 @@ for key, default in {
     "candidate_context": None,
     "last_created_job_id": None,
     "public_base_url_input": "",
+    "form_reset_counter": 0,
     "wo_veicolo": "",
     "wo_categoria": CATEGORIE[0],
     "wo_urgenza": URGENZE[0],
@@ -187,17 +188,15 @@ def build_operator_url(job_id: str) -> str:
 
 
 def reset_new_job_form() -> None:
-    st.session_state["wo_veicolo"] = ""
-    st.session_state["wo_categoria"] = CATEGORIE[0]
-    st.session_state["wo_urgenza"] = URGENZE[0]
-    st.session_state["wo_planned_date"] = local_now().date()
-    st.session_state["wo_ore_std"] = 3.0
-    st.session_state["wo_fermo"] = True
-    st.session_state["wo_safety"] = False
-    st.session_state["wo_ricambi"] = True
-    st.session_state["wo_sla"] = 24.0
-    st.session_state["wo_prev_ricambi"] = 0.0
-    st.session_state["wo_note"] = ""
+    """Reset sicuro del form senza modificare widget già renderizzati.
+
+    Streamlit non consente di assegnare direttamente un nuovo valore a
+    st.session_state[<key>] dopo che un widget con la stessa key è già stato
+    creato nel ciclo corrente. Per questo usiamo un contatore che cambia la
+    key del form e dei suoi widget al rerun successivo: Streamlit renderizza
+    un form nuovo, pulito, senza generare StreamlitAPIException.
+    """
+    st.session_state["form_reset_counter"] = int(st.session_state.get("form_reset_counter", 0)) + 1
 
 
 def initial_skill_profiles() -> Dict[str, dict]:
@@ -1118,30 +1117,44 @@ with manager_tabs[0]:
     st.markdown("L'assegnazione è **manuale**, ma il sistema propone il tecnico migliore usando skill, carico, fatica, planning, mentoring e priorità composita.")
     left, right = st.columns([1.1, 1.5])
     with left:
-        with st.form("nuova_bolla_integrata", clear_on_submit=False):
-            st.text_input("Targa / Modello veicolo", key="wo_veicolo")
-            st.selectbox("Area intervento", CATEGORIE, key="wo_categoria")
-            st.selectbox("Urgenza percepita", URGENZE, key="wo_urgenza")
-            st.date_input("Data pianificata", key="wo_planned_date")
-            st.number_input("Ore standard previste", min_value=0.5, max_value=24.0, step=0.5, key="wo_ore_std")
-            st.checkbox("Veicolo fermo / indisponibile", key="wo_fermo")
-            st.checkbox("Impatto sicurezza", key="wo_safety")
-            st.checkbox("Ricambi disponibili", key="wo_ricambi")
-            st.number_input("SLA / scadenza promessa (ore)", min_value=1.0, max_value=168.0, step=1.0, key="wo_sla")
-            st.number_input("Preventivo ricambi (€)", min_value=0.0, step=10.0, key="wo_prev_ricambi")
-            st.text_area("Descrizione / note di accettazione", height=90, key="wo_note")
+        form_counter = int(st.session_state.get("form_reset_counter", 0))
+        form_keys = {
+            "veicolo": f"wo_veicolo_{form_counter}",
+            "categoria": f"wo_categoria_{form_counter}",
+            "urgenza": f"wo_urgenza_{form_counter}",
+            "planned_date": f"wo_planned_date_{form_counter}",
+            "ore_std": f"wo_ore_std_{form_counter}",
+            "fermo": f"wo_fermo_{form_counter}",
+            "safety": f"wo_safety_{form_counter}",
+            "ricambi": f"wo_ricambi_{form_counter}",
+            "sla": f"wo_sla_{form_counter}",
+            "prev_ricambi": f"wo_prev_ricambi_{form_counter}",
+            "note": f"wo_note_{form_counter}",
+        }
+        with st.form(f"nuova_bolla_integrata_{form_counter}", clear_on_submit=False):
+            st.text_input("Targa / Modello veicolo", value="", key=form_keys["veicolo"])
+            st.selectbox("Area intervento", CATEGORIE, index=0, key=form_keys["categoria"])
+            st.selectbox("Urgenza percepita", URGENZE, index=0, key=form_keys["urgenza"])
+            st.date_input("Data pianificata", value=local_now().date(), key=form_keys["planned_date"])
+            st.number_input("Ore standard previste", min_value=0.5, max_value=24.0, value=3.0, step=0.5, key=form_keys["ore_std"])
+            st.checkbox("Veicolo fermo / indisponibile", value=True, key=form_keys["fermo"])
+            st.checkbox("Impatto sicurezza", value=False, key=form_keys["safety"])
+            st.checkbox("Ricambi disponibili", value=True, key=form_keys["ricambi"])
+            st.number_input("SLA / scadenza promessa (ore)", min_value=1.0, max_value=168.0, value=24.0, step=1.0, key=form_keys["sla"])
+            st.number_input("Preventivo ricambi (€)", min_value=0.0, value=0.0, step=10.0, key=form_keys["prev_ricambi"])
+            st.text_area("Descrizione / note di accettazione", value="", height=90, key=form_keys["note"])
             submitted_preview = st.form_submit_button("Analizza assegnazione")
-        veicolo = st.session_state.get("wo_veicolo", "").strip()
-        categoria = st.session_state.get("wo_categoria", CATEGORIE[0])
-        urgenza = st.session_state.get("wo_urgenza", URGENZE[0])
-        planned_date = st.session_state.get("wo_planned_date", local_now().date())
-        ore_std = float(st.session_state.get("wo_ore_std", 3.0))
-        fermo_veicolo = bool(st.session_state.get("wo_fermo", True))
-        safety_risk = bool(st.session_state.get("wo_safety", False))
-        ricambi_disponibili = bool(st.session_state.get("wo_ricambi", True))
-        sla_hours = float(st.session_state.get("wo_sla", 24.0))
-        preventivo_ricambi = float(st.session_state.get("wo_prev_ricambi", 0.0))
-        note = st.session_state.get("wo_note", "")
+        veicolo = st.session_state.get(form_keys["veicolo"], "").strip()
+        categoria = st.session_state.get(form_keys["categoria"], CATEGORIE[0])
+        urgenza = st.session_state.get(form_keys["urgenza"], URGENZE[0])
+        planned_date = st.session_state.get(form_keys["planned_date"], local_now().date())
+        ore_std = float(st.session_state.get(form_keys["ore_std"], 3.0))
+        fermo_veicolo = bool(st.session_state.get(form_keys["fermo"], True))
+        safety_risk = bool(st.session_state.get(form_keys["safety"], False))
+        ricambi_disponibili = bool(st.session_state.get(form_keys["ricambi"], True))
+        sla_hours = float(st.session_state.get(form_keys["sla"], 24.0))
+        preventivo_ricambi = float(st.session_state.get(form_keys["prev_ricambi"], 0.0))
+        note = st.session_state.get(form_keys["note"], "")
         if submitted_preview and veicolo:
             priority_score, priority_band = compute_priority_score(urgenza, fermo_veicolo, safety_risk, ricambi_disponibili, sla_hours, ore_std)
             candidates = get_assignment_candidates(categoria, urgenza, work_df, tech_profiles, ore_std, planned_date.isoformat(), priority_score)
